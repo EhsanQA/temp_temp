@@ -120,3 +120,11 @@ def find_hef_and_postprocess():
 HEF_PATH, POSTPROCESS_SO = find_hef_and_postprocess()
 POSTPROCESS_FUNCTION = "filter_letterbox"   # what the examples typically use
 ```
+
+```bash
+sudo apt install -y gstreamer1.0-tools \
+  gstreamer1.0-plugins-good \
+  gstreamer1.0-plugins-bad \
+  gstreamer1.0-plugins-ugly \
+  gstreamer1.0-libav
+```
