@@ -3,9 +3,12 @@ https://docs.google.com/presentation/d/1zYxR4G0wJFLDkvmqwWbI_PStGJ1yX2hjykahkLfj
 https://docs.google.com/presentation/d/1DXHP5Zfz3B-aKvx5-f9oXRL1_gLt8k7jetGwQ1B3Jok/edit?usp=sharing
 
 
-```python
+```bash
 sudo apt update
 sudo apt install -y python3-picamera2 python3-opencv python3-tk python3-pil python3-pil.imagetk ffmpeg
 python3 -m pip install -U pip
 python3 -m pip install ultralytics[export]
+```
+```bash
+sudo apt install -y python3-gi gir1.2-gtk-3.0 gstreamer1.0-gtk3 ffmpeg
 ```
