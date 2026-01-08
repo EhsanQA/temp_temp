@@ -60,8 +60,8 @@ def link_chain(*elems):
 
 def pick_detection_hef() -> str:
     """
-    Pick a YOLO *detection* HEF (avoid pose/seg). Your earlier issues were caused
-    by using a pose HEF with detection postprocess.
+    Pick a YOLO *detection* HEF (avoid pose/seg). Pose HEFs + YOLO detection postprocess
+    can yield black output or empty detections.
     """
     base = Path("/usr/local/hailo/resources/models/hailo8l")
     if not base.exists():
@@ -97,13 +97,10 @@ HEF_PATH = pick_detection_hef()
 
 
 def _bbox_get(bbox, name: str):
-    """
-    Supports bbox.xmin() or bbox.xmin attribute style.
-    """
+    """Supports bbox.xmin() or bbox.xmin attribute style."""
     if hasattr(bbox, name):
         v = getattr(bbox, name)
         return v() if callable(v) else v
-    # Some APIs use x_min/y_min
     alt = {"xmin": "x_min", "ymin": "y_min", "width": "w", "height": "h"}.get(name)
     if alt and hasattr(bbox, alt):
         v = getattr(bbox, alt)
@@ -111,13 +108,73 @@ def _bbox_get(bbox, name: str):
     return None
 
 
+def _draw_boxes_inplace(buf: Gst.Buffer, caps: Gst.Caps, detections, thickness: int = 2):
+    """
+    Draw bounding boxes (no text) directly into the mapped buffer.
+    Works for RGB or BGRx/RGBx.
+    """
+    vinfo = GstVideo.VideoInfo()
+    if not vinfo.from_caps(caps):
+        return
+
+    w, h = vinfo.width, vinfo.height
+    stride = vinfo.stride[0]
+    fmt = vinfo.finfo.name  # e.g., "RGB", "BGRx", ...
+
+    ok, mapinfo = buf.map(Gst.MapFlags.READ | Gst.MapFlags.WRITE)
+    if not ok:
+        return
+
+    try:
+        if fmt == "RGB":
+            bpp = 3
+            row_pixels = stride // bpp
+            frame = np.ndarray((h, row_pixels, 3), dtype=np.uint8, buffer=mapinfo.data)
+            frame = frame[:, :w, :]
+            color = (0, 255, 0)  # green (same in RGB and BGR)
+            for det in detections:
+                bbox = det.get_bbox()
+                xmin = _bbox_get(bbox, "xmin")
+                ymin = _bbox_get(bbox, "ymin")
+                bw = _bbox_get(bbox, "width")
+                bh = _bbox_get(bbox, "height")
+                if xmin is None or ymin is None or bw is None or bh is None:
+                    continue
+                x0 = int(max(0, min(w - 1, xmin * w)))
+                y0 = int(max(0, min(h - 1, ymin * h)))
+                x1 = int(max(0, min(w - 1, (xmin + bw) * w)))
+                y1 = int(max(0, min(h - 1, (ymin + bh) * h)))
+                cv2.rectangle(frame, (x0, y0), (x1, y1), color, thickness)
+
+        elif fmt in ("BGRx", "RGBx", "RGBA", "BGRA"):
+            bpp = 4
+            row_pixels = stride // bpp
+            frame = np.ndarray((h, row_pixels, 4), dtype=np.uint8, buffer=mapinfo.data)
+            frame = frame[:, :w, :]
+            color = (0, 255, 0, 255)
+            for det in detections:
+                bbox = det.get_bbox()
+                xmin = _bbox_get(bbox, "xmin")
+                ymin = _bbox_get(bbox, "ymin")
+                bw = _bbox_get(bbox, "width")
+                bh = _bbox_get(bbox, "height")
+                if xmin is None or ymin is None or bw is None or bh is None:
+                    continue
+                x0 = int(max(0, min(w - 1, xmin * w)))
+                y0 = int(max(0, min(h - 1, ymin * h)))
+                x1 = int(max(0, min(w - 1, (xmin + bw) * w)))
+                y1 = int(max(0, min(h - 1, (ymin + bh) * h)))
+                cv2.rectangle(frame, (x0, y0), (x1, y1), color, thickness)
+
+        else:
+            # Unknown format; you can force RGB in the pipeline if needed.
+            return
+
+    finally:
+        buf.unmap(mapinfo)
+
+
 class CamRunner:
-    """
-    One camera pipeline:
-      libcamerasrc -> hailo pipeline -> (BGRx) -> identity (probe draws boxes) -> tee
-         tee -> gtksink (preview)
-         tee -> record bin (mkv -> later remux to mp4)
-    """
     def __init__(self, cam_name: str, idx: int):
         self.cam_name = cam_name
         self.idx = idx
@@ -135,10 +192,9 @@ class CamRunner:
         self._frame_count = 0
 
     def build(self):
-        # Key points:
-        # - NO hailooverlay (so no text is drawn)
-        # - Force BGRx before identity so we can draw with numpy/cv2
-        # - Removed NMS properties that were causing errors
+        # IMPORTANT CHANGE:
+        # identity_callback is now immediately after hailoaggregator output (before videoconvert),
+        # so detections metadata is still present.
         pipe = f"""
             libcamerasrc camera-name="{self.cam_name}" name=source_{self.idx} !
             video/x-raw,format=NV12,width={PREVIEW_W},height={PREVIEW_H},framerate={PREVIEW_FPS}/1 !
@@ -177,9 +233,9 @@ class CamRunner:
 
             inference_wrapper_agg_{self.idx}. !
                 queue name=postagg_q_{self.idx} leaky=no max-size-buffers=3 max-size-bytes=0 max-size-time=0 !
+                identity name=identity_callback_{self.idx} !
                 videoconvert n-threads=2 qos=false !
                 video/x-raw,format=BGRx !
-                identity name=identity_callback_{self.idx} !
                 tee name=tee_{self.idx}
 
             tee_{self.idx}. !
@@ -212,59 +268,29 @@ class CamRunner:
         if buf is None:
             return Gst.PadProbeReturn.OK
 
-        # Make writable so drawing changes propagate
+        # Make writable so our drawing persists
         try:
             buf = buf.make_writable()
+            if hasattr(info, "set_buffer"):
+                info.set_buffer(buf)
         except Exception:
             pass
 
         self._frame_count += 1
 
-        # Detections from ROI
         roi = hailo.get_roi_from_buffer(buf)
         detections = roi.get_objects_typed(hailo.HAILO_DETECTION)
+
+        # Debug: show that detections exist
+        if self._frame_count % 30 == 0:
+            print(f"[CAM{self.idx}] frame={self._frame_count} dets={len(detections)}")
 
         caps = pad.get_current_caps()
         if not caps:
             return Gst.PadProbeReturn.OK
 
-        vinfo = GstVideo.VideoInfo()
-        if not vinfo.from_caps(caps):
-            return Gst.PadProbeReturn.OK
-
-        w, h = vinfo.width, vinfo.height
-        stride = vinfo.stride[0]
-
-        ok, mapinfo = buf.map(Gst.MapFlags.READ | Gst.MapFlags.WRITE)
-        if not ok:
-            return Gst.PadProbeReturn.OK
-
-        try:
-            # BGRx -> 4 bytes per pixel. Stride may be larger than 4*w.
-            row_pixels = stride // 4
-            frame = np.ndarray((h, row_pixels, 4), dtype=np.uint8, buffer=mapinfo.data)
-            frame = frame[:, :w, :]  # crop valid width
-
-            # Draw ONLY bounding boxes (no text)
-            for det in detections:
-                bbox = det.get_bbox()
-                xmin = _bbox_get(bbox, "xmin")
-                ymin = _bbox_get(bbox, "ymin")
-                bw = _bbox_get(bbox, "width")
-                bh = _bbox_get(bbox, "height")
-                if xmin is None or ymin is None or bw is None or bh is None:
-                    continue
-
-                x0 = int(max(0, min(w - 1, xmin * w)))
-                y0 = int(max(0, min(h - 1, ymin * h)))
-                x1 = int(max(0, min(w - 1, (xmin + bw) * w)))
-                y1 = int(max(0, min(h - 1, (ymin + bh) * h)))
-
-                cv2.rectangle(frame, (x0, y0), (x1, y1), (0, 255, 0, 255), 2)
-
-        finally:
-            buf.unmap(mapinfo)
-
+        # Draw only boxes, no text
+        _draw_boxes_inplace(buf, caps, detections, thickness=2)
         return Gst.PadProbeReturn.OK
 
     def start_recording(self):
@@ -282,7 +308,7 @@ class CamRunner:
         caps = make("capsfilter")
         caps.set_property("caps", Gst.Caps.from_string("video/x-raw,format=I420"))
 
-        # IMPORTANT: software encoders only (avoid /dev/video9 V4L2 issues)
+        # Software encoders only (avoid /dev/video9 V4L2 errors)
         enc = Gst.ElementFactory.make("x264enc", None)
         enc_name = None
         if enc is not None:
@@ -335,7 +361,6 @@ class CamRunner:
         self._tee_pad = tee_pad
         self._rec_bin = rec_bin
         self._recording = True
-
         print(f"[CAM{self.idx}] recording -> {self._last_mkv} (encoder={enc_name})")
 
     def stop_recording(self):
@@ -359,7 +384,6 @@ class CamRunner:
             pass
 
         mkv = self._last_mkv
-
         self._tee_pad = None
         self._rec_bin = None
         self._recording = False
@@ -456,6 +480,7 @@ if __name__ == "__main__":
     print("  HEF:", HEF_PATH)
     print("  Postprocess SO:", POSTPROCESS_SO)
     print("  Postprocess FN:", POSTPROCESS_FN)
+
     win = App()
     win.show_all()
     Gtk.main()
