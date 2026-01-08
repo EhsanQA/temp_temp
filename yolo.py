@@ -1,315 +1,252 @@
 #!/usr/bin/env python3
-import threading
-import queue
+import os
+import sys
 import time
+import threading
+from pathlib import Path
 from datetime import datetime
 
+# Prevent the Hailo pipeline from opening its own video window.
+# (We will show the frames inside our Tk window instead.)
+os.environ.setdefault("HAILO_RPI_SINK", "fakesink")
+
 import cv2
-import numpy as np
 import tkinter as tk
-from PIL import Image, ImageTk
+from tkinter import ttk, messagebox
 
-from picamera2 import Picamera2, MappedArray
-from picamera2.encoders import H264Encoder
-from picamera2.outputs import FfmpegOutput
+try:
+    from PIL import Image, ImageTk
+except Exception as e:
+    raise SystemExit(
+        "Pillow ImageTk is missing. Install with:\n"
+        "  sudo apt install -y python3-pil.imagetk\n"
+        f"Original error: {e}"
+    )
 
-from ultralytics import YOLO
+# Hailo apps infra imports (installed by the hailo-rpi5-examples environment)
+import gi
+gi.require_version('Gst', '1.0')
+from gi.repository import Gst
 
-
-# -------------------- TUNABLE SETTINGS --------------------
-FPS = 10
-
-# Recording resolution (what gets saved)
-RECORD_SIZE = (1280, 720)     # Try (1920, 1080) only if your Pi keeps up
-
-# Inference resolution (smaller = faster)
-INFER_SIZE = (640, 360)
-
-# YOLO model (smallest models are best on CPU)
-MODEL_PATH = "yolo11n.pt"     # or "yolov8n.pt"
-
-CONF_THRES = 0.25
-IOU_THRES = 0.45
-
-H264_BITRATE = 8_000_000      # 8 Mbps for 720p@10fps; adjust as desired
-# ----------------------------------------------------------
+from hailo_apps_infra.detection_pipeline import GStreamerDetectionApp
+from hailo_apps_infra.hailo_rpi_common import (
+    get_caps_from_pad,
+    get_numpy_from_buffer,
+    app_callback_class,
+)
+import hailo
 
 
-class CameraWorker(threading.Thread):
-    def __init__(self, frame_queue: queue.Queue, status_queue: queue.Queue):
-        super().__init__(daemon=True)
-        self.frame_queue = frame_queue
-        self.status_queue = status_queue
+class UserData(app_callback_class):
+    """Thread-safe storage for the latest annotated frame."""
+    def __init__(self, conf_threshold: float = 0.30):
+        super().__init__()
+        self.use_frame = True
+        self.conf_threshold = conf_threshold
+        self._lock = threading.Lock()
+        self._frame = None
+        self._count = -1
 
-        self.cmd_queue = queue.Queue()
-        self.stop_flag = threading.Event()
+    def set_frame(self, frame, count: int):
+        with self._lock:
+            self._frame = frame
+            self._count = count
 
-        self.picam2 = None
-        self.model = None
-
-        self.recording = False
-        self.encoder = None
-        self.output = None
-
-        # Latest detections in INFER_SIZE coordinates:
-        # list of (x1, y1, x2, y2, conf, cls_id)
-        self.det_lock = threading.Lock()
-        self.dets = []
-
-        self.main_w = None
-        self.main_h = None
-        self.lores_w = None
-        self.lores_h = None
-
-    def send_cmd(self, cmd: str):
-        """cmd in {'record','stop','quit'}"""
-        self.cmd_queue.put(cmd)
-
-    def _set_status(self, msg: str):
-        try:
-            self.status_queue.put_nowait(msg)
-        except queue.Full:
-            pass
-
-    def _put_latest_frame(self, rgb_frame: np.ndarray):
-        """Keep only the latest frame (drop older)."""
-        try:
-            while True:
-                self.frame_queue.get_nowait()
-        except queue.Empty:
-            pass
-        try:
-            self.frame_queue.put_nowait(rgb_frame)
-        except queue.Full:
-            pass
-
-    def _draw_boxes_on_recording(self, request):
-        """
-        Picamera2 callback: draw on the 'main' stream buffer so the *recorded video* contains the boxes.
-        Keep this extremely light (drawing only).  (Picamera2 warns against heavy work in callbacks.)
-        """
-        with self.det_lock:
-            dets = list(self.dets)
-
-        if not dets:
-            return
-
-        xscale = self.main_w / self.lores_w
-        yscale = self.main_h / self.lores_h
-
-        with MappedArray(request, "main") as m:
-            # m.array is typically 4-channel (XRGB8888-like). OpenCV is happy drawing on it.
-            for (x1, y1, x2, y2, conf, cls_id) in dets:
-                X1 = int(x1 * xscale)
-                Y1 = int(y1 * yscale)
-                X2 = int(x2 * xscale)
-                Y2 = int(y2 * yscale)
-
-                name = self.model.names[int(cls_id)] if self.model and hasattr(self.model, "names") else str(int(cls_id))
-                label = f"{name} {conf:.2f}"
-
-                cv2.rectangle(m.array, (X1, Y1), (X2, Y2), (0, 255, 0, 0), 2)
-                cv2.putText(
-                    m.array,
-                    label,
-                    (X1, max(25, Y1 - 8)),
-                    cv2.FONT_HERSHEY_SIMPLEX,
-                    0.7,
-                    (0, 255, 0, 0),
-                    2,
-                    cv2.LINE_AA,
-                )
-
-    def _start_recording(self):
-        if self.recording:
-            return
-        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-        filename = f"record_{ts}.mp4"
-
-        self.encoder = H264Encoder(bitrate=H264_BITRATE)
-        self.output = FfmpegOutput(filename)
-
-        # Record the 'main' stream (which we annotate in the callback)
-        self.picam2.start_recording(self.encoder, self.output)
-        self.recording = True
-        self._set_status(f"Recording → {filename}")
-
-    def _stop_recording(self):
-        if not self.recording:
-            return
-        self.picam2.stop_recording()
-        self.recording = False
-        self.encoder = None
-        self.output = None
-        self._set_status("Stopped (saved MP4).")
-
-    def _shutdown(self):
-        try:
-            if self.recording:
-                self._stop_recording()
-        except Exception:
-            pass
-        try:
-            if self.picam2:
-                self.picam2.stop()
-        except Exception:
-            pass
-
-    def run(self):
-        # Load YOLO
-        self._set_status("Loading YOLO model...")
-        self.model = YOLO(MODEL_PATH)
-        self._set_status(f"Loaded model: {MODEL_PATH}")
-
-        # Camera init
-        self.picam2 = Picamera2()
-        config = self.picam2.create_video_configuration(
-            main={"size": RECORD_SIZE, "format": "XRGB8888"},
-            lores={"size": INFER_SIZE, "format": "XRGB8888"},
-            controls={"FrameRate": FPS},
-        )
-        self.picam2.configure(config)
-
-        (self.main_w, self.main_h) = self.picam2.stream_configuration("main")["size"]
-        (self.lores_w, self.lores_h) = self.picam2.stream_configuration("lores")["size"]
-
-        # Draw onto main stream so recording includes overlays
-        self.picam2.post_callback = self._draw_boxes_on_recording
-        self.picam2.start()
-        self._set_status("Camera started.")
-
-        try:
-            while not self.stop_flag.is_set():
-                # Handle any pending commands
-                try:
-                    while True:
-                        cmd = self.cmd_queue.get_nowait()
-                        if cmd == "record":
-                            self._start_recording()
-                        elif cmd == "stop":
-                            self._stop_recording()
-                        elif cmd == "quit":
-                            self.stop_flag.set()
-                            break
-                except queue.Empty:
-                    pass
-
-                if self.stop_flag.is_set():
-                    break
-
-                # Grab lores frame for inference + preview
-                lores = self.picam2.capture_array("lores")
-                if lores.ndim == 3 and lores.shape[2] == 4:
-                    frame_bgr = lores[:, :, :3]
-                else:
-                    frame_bgr = lores
-
-                # YOLO inference
-                results = self.model(
-                    frame_bgr,
-                    imgsz=640,
-                    conf=CONF_THRES,
-                    iou=IOU_THRES,
-                    verbose=False,
-                )
-                r = results[0]
-
-                # Store detections for recording overlay (in lores coords)
-                dets = []
-                if r.boxes is not None and len(r.boxes) > 0:
-                    xyxy = r.boxes.xyxy.cpu().numpy()
-                    confs = r.boxes.conf.cpu().numpy()
-                    clss = r.boxes.cls.cpu().numpy().astype(int)
-                    for (x1, y1, x2, y2), c, cl in zip(xyxy, confs, clss):
-                        dets.append((float(x1), float(y1), float(x2), float(y2), float(c), int(cl)))
-
-                with self.det_lock:
-                    self.dets = dets
-
-                # Preview frame with boxes (Ultralytics helper)
-                annotated_bgr = r.plot()
-                annotated_rgb = cv2.cvtColor(annotated_bgr, cv2.COLOR_BGR2RGB)
-                self._put_latest_frame(annotated_rgb)
-
-                # If you want to reduce CPU load, uncomment:
-                # time.sleep(0.001)
-
-        finally:
-            self._shutdown()
-            self._set_status("Camera stopped.")
+    def get_frame(self):
+        with self._lock:
+            return self._frame, self._count
 
 
-class App:
+def hailo_callback(pad, info, user_data: UserData):
+    buffer = info.get_buffer()
+    if buffer is None:
+        return Gst.PadProbeReturn.OK
+
+    # Increment internal frame counter (provided by app_callback_class)
+    user_data.increment()
+    count = user_data.get_count()
+
+    fmt, width, height = get_caps_from_pad(pad)
+
+    frame_bgr = None
+    if user_data.use_frame and fmt is not None and width is not None and height is not None:
+        frame = get_numpy_from_buffer(buffer, fmt, width, height)  # typically RGB
+        frame_bgr = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
+
+    # Get detections from metadata
+    roi = hailo.get_roi_from_buffer(buffer)
+    detections = roi.get_objects_typed(hailo.HAILO_DETECTION)
+
+    # Draw boxes on the frame we will preview/record
+    if frame_bgr is not None and width and height:
+        for det in detections:
+            conf = float(det.get_confidence())
+            if conf < user_data.conf_threshold:
+                continue
+
+            label = det.get_label()
+            bbox = det.get_bbox()  # normalized coords
+
+            x1 = int(max(0.0, bbox.xmin()) * width)
+            y1 = int(max(0.0, bbox.ymin()) * height)
+            x2 = int(min(1.0, bbox.xmin() + bbox.width()) * width)
+            y2 = int(min(1.0, bbox.ymin() + bbox.height()) * height)
+
+            cv2.rectangle(frame_bgr, (x1, y1), (x2, y2), (0, 255, 0), 2)
+            text = f"{label} {conf:.2f}"
+            y_text = max(0, y1 - 7)
+            cv2.putText(frame_bgr, text, (x1, y_text),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1, cv2.LINE_AA)
+
+        user_data.set_frame(frame_bgr, count)
+
+    return Gst.PadProbeReturn.OK
+
+
+class AppGUI:
     def __init__(self, root: tk.Tk):
         self.root = root
-        self.root.title("Pi Camera + YOLO Recorder")
+        self.root.title("YOLO Preview + Recorder (Hailo NPU)")
+        self.root.geometry("900x650")
 
-        self.frame_queue = queue.Queue(maxsize=1)
-        self.status_queue = queue.Queue(maxsize=10)
+        self.user_data = UserData(conf_threshold=0.30)
 
-        self.video_label = tk.Label(root)
-        self.video_label.pack(padx=8, pady=8)
+        # Video UI
+        self.video_label = ttk.Label(root)
+        self.video_label.pack(fill="both", expand=True, padx=8, pady=8)
 
-        btn_frame = tk.Frame(root)
-        btn_frame.pack(pady=6)
+        # Controls
+        controls = ttk.Frame(root)
+        controls.pack(fill="x", padx=8, pady=(0, 8))
 
-        self.record_btn = tk.Button(btn_frame, text="Record", width=12, command=self.on_record)
-        self.record_btn.grid(row=0, column=0, padx=6)
+        self.status_var = tk.StringVar(value="Status: starting…")
+        ttk.Label(controls, textvariable=self.status_var).pack(side="left")
 
-        self.stop_btn = tk.Button(btn_frame, text="Stop", width=12, command=self.on_stop, state=tk.DISABLED)
-        self.stop_btn.grid(row=0, column=1, padx=6)
+        self.record_btn = ttk.Button(controls, text="Record", command=self.start_recording)
+        self.record_btn.pack(side="right", padx=(6, 0))
 
-        self.status_var = tk.StringVar(value="Starting...")
-        self.status_label = tk.Label(root, textvariable=self.status_var)
-        self.status_label.pack(pady=(0, 8))
+        self.stop_btn = ttk.Button(controls, text="Stop", command=self.stop_recording, state="disabled")
+        self.stop_btn.pack(side="right")
 
-        self.worker = CameraWorker(self.frame_queue, self.status_queue)
-        self.worker.start()
+        # Recording state
+        self.recording = False
+        self.writer = None
+        self.last_written_count = -1
+        self.last_display_count = -1
+        self.output_path = None
+
+        # Start Hailo pipeline in background thread
+        self._start_hailo_thread()
+
+        # Periodic UI update
+        self._update_ui()
 
         self.root.protocol("WM_DELETE_WINDOW", self.on_close)
 
-        self._last_photo = None
-        self.update_ui()
+    def _start_hailo_thread(self):
+        def run_pipeline():
+            try:
+                Gst.init(None)
 
-    def on_record(self):
-        self.worker.send_cmd("record")
-        self.record_btn.config(state=tk.DISABLED)
-        self.stop_btn.config(state=tk.NORMAL)
+                # Force camera input by default (same idea as running: detection.py --input rpi)
+                sys.argv = [sys.argv[0], "--input", "rpi"]
 
-    def on_stop(self):
-        self.worker.send_cmd("stop")
-        self.record_btn.config(state=tk.NORMAL)
-        self.stop_btn.config(state=tk.DISABLED)
+                app = GStreamerDetectionApp(hailo_callback, self.user_data)
+                app.run()  # blocking
+            except Exception as e:
+                # If pipeline fails, surface it in the UI
+                self.status_var.set(f"Status: Hailo pipeline error: {e}")
 
-    def on_close(self):
-        self.worker.send_cmd("quit")
-        self.root.after(200, self.root.destroy)
+        t = threading.Thread(target=run_pipeline, daemon=True)
+        t.start()
 
-    def update_ui(self):
-        # Update preview
-        try:
-            frame = self.frame_queue.get_nowait()
-            img = Image.fromarray(frame)
-            photo = ImageTk.PhotoImage(img)
-            self.video_label.configure(image=photo)
-            self._last_photo = photo  # keep reference
-        except queue.Empty:
-            pass
+    def _update_ui(self):
+        frame, count = self.user_data.get_frame()
+
+        if frame is not None and count != self.last_display_count:
+            self.last_display_count = count
+
+            # Show frame in Tk
+            rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            img = Image.fromarray(rgb)
+            imgtk = ImageTk.PhotoImage(image=img)
+            self.video_label.imgtk = imgtk  # keep reference
+            self.video_label.configure(image=imgtk)
+
+            # Write exactly one frame per pipeline frame while recording
+            if self.recording and self.writer is not None and count != self.last_written_count:
+                self.last_written_count = count
+                self.writer.write(frame)
 
         # Update status
-        try:
-            while True:
-                msg = self.status_queue.get_nowait()
-                self.status_var.set(msg)
-        except queue.Empty:
-            pass
+        if self.recording and self.output_path:
+            self.status_var.set(f"Status: RECORDING → {self.output_path.name}")
+        else:
+            self.status_var.set("Status: preview running")
 
-        self.root.after(15, self.update_ui)
+        self.root.after(20, self._update_ui)
+
+    def start_recording(self):
+        if self.recording:
+            return
+
+        frame, _ = self.user_data.get_frame()
+        if frame is None:
+            messagebox.showwarning("Not ready", "No camera frame yet. Wait a second and press Record again.")
+            return
+
+        h, w = frame.shape[:2]
+        out_dir = Path.home() / "Videos" / "hailo_recordings"
+        out_dir.mkdir(parents=True, exist_ok=True)
+
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        self.output_path = out_dir / f"record_{ts}.mp4"
+
+        fps = 10  # your requirement
+        fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+        self.writer = cv2.VideoWriter(str(self.output_path), fourcc, fps, (w, h))
+        if not self.writer.isOpened():
+            self.writer = None
+            messagebox.showerror("VideoWriter error", "Could not open MP4 writer. Try installing codecs or use .avi.")
+            return
+
+        self.recording = True
+        self.last_written_count = -1
+        self.record_btn.configure(state="disabled")
+        self.stop_btn.configure(state="normal")
+
+    def stop_recording(self):
+        if not self.recording:
+            return
+
+        self.recording = False
+        self.record_btn.configure(state="normal")
+        self.stop_btn.configure(state="disabled")
+
+        if self.writer is not None:
+            self.writer.release()
+            self.writer = None
+
+        if self.output_path:
+            messagebox.showinfo("Saved", f"Saved:\n{self.output_path}")
+
+    def on_close(self):
+        try:
+            if self.writer is not None:
+                self.writer.release()
+        finally:
+            self.root.destroy()
 
 
 def main():
     root = tk.Tk()
-    App(root)
+    # Use ttk default theme
+    try:
+        style = ttk.Style()
+        style.theme_use("clam")
+    except Exception:
+        pass
+    AppGUI(root)
     root.mainloop()
 
 
